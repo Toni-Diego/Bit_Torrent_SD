@@ -3,112 +3,143 @@ import socketserver
 import threading
 import json
 import time
-from config import TRACKER_HOST, TRACKER_PORT
+import sys
+from config import TRACKER_HOST
 
-# Base de datos en memoria del tracker.
-# Protegida por un Lock para acceso concurrente seguro.
-# Estructura:
+# Estructura de datos para almacenar la información de la red.
+# Usamos un diccionario donde la clave es el hash del torrent.
+# El valor es otro diccionario con los peers.
 # {
-#   'torrent_file_hash': {
-#       'peers': {('ip', port), ('ip', port), ...}
+#   "torrent_hash_1": {
+#     "peer_id_1": {"ip": "...", "port": ..., "progress": 1.0, "last_seen": ...},
+#     "peer_id_2": {"ip": "...", "port": ..., "progress": 0.5, "last_seen": ...}
 #   }
 # }
-torrents_db = {}
-db_lock = threading.Lock()
+torrents = {}
+lock = threading.Lock()
 
-def display_tracker_status():
-    """Función que se ejecuta en un hilo para mostrar el estado del tracker periódicamente."""
-    while True:
-        time.sleep(10) # Muestra el estado cada 10 segundos
-        print("\n----- ESTADO DEL TRACKER -----")
-        with db_lock:
-            if not torrents_db:
-                print("No hay torrents activos.")
-                continue
-            
-            for torrent_hash, data in torrents_db.items():
-                print(f"\n> Torrent: {torrent_hash[:12]}...")
-                peers_info = data['peers']
-                if not peers_info:
-                    print("  - Sin peers conectados.")
-                else:
-                    for peer, info in peers_info.items():
-                        progress_percent = info['progress'] * 100
-                        print(f"  - Peer: {peer[0]}:{peer[1]} -> Progreso: {progress_percent:.2f}%")
-        print("------------------------------\n")
-
-class TorrentRequestHandler(socketserver.BaseRequestHandler):
+class TrackerHandler(socketserver.BaseRequestHandler):
     """
-    Maneja las solicitudes de los peers.
-    Cada conexión se maneja en un hilo separado gracias a ThreadingTCPServer.
-    Corresponde a la funcionalidad de Tracker.java y TorrentTrack.java.
+    Maneja las conexiones entrantes de los peers.
+    Una instancia de esta clase es creada para cada conexión.
     """
     def handle(self):
         try:
-            # 1. Recibir el mensaje del peer
-            data = self.request.recv(1024).strip()
-            if not data:
+            raw_data = self.request.recv(1024).strip()
+            if not raw_data:
                 return
-
-            message = json.loads(data.decode('utf-8'))
-            print(f"[{time.ctime()}] Mensaje recibido de {self.client_address}: {message}")
-
-            # 2. Procesar el mensaje de "anuncio"
-            if message.get('action') == 'announce':
-                torrent_hash = message['torrent_hash']
-                peer_port = message['port']
-                peer_ip = self.client_address[0]
-                peer_address = (peer_ip, peer_port)
-
-                # --- MODIFICACIÓN AQUÍ ---
-                # Leer los nuevos datos de progreso
-                num_owned = message.get('num_pieces_owned', 0)
-                total_pieces = message.get('total_pieces', 1) # Evitar división por cero
-                progress = num_owned / total_pieces if total_pieces > 0 else 0
-                # --------------------------
-
-                # Usar un Lock para modificar la base de datos de forma segura
-                with db_lock:
-                    if torrent_hash not in torrents_db:
-                        torrents_db[torrent_hash] = {'peers': {}}
-                    
-                    # Obtener lista de peers para enviar como respuesta (sin el actual)
-                    # El formato de la respuesta no cambia, solo es una lista de direcciones
-                    peer_list = list(torrents_db[torrent_hash]['peers'].keys())
-                    
-                    # Actualizar o añadir la información del peer en la DB
-                    torrents_db[torrent_hash]['peers'][peer_address] = {
-                        'progress': progress,
-                        'last_seen': time.time()
-                    }
-                
-                response = {'peers': peer_list}
-                self.request.sendall(json.dumps(response).encode('utf-8'))
-                print(f"[{time.ctime()}] Respondiendo a {self.client_address} con {len(current_peers)} peers.")
-                
-            else:
-                print(f"[{time.ctime()}] Acción desconocida: {message.get('action')}")
-
+            
+            message = json.loads(raw_data.decode('utf-8'))
+            command = message.get('command')
+            
+            with lock:
+                if command == 'announce':
+                    self.handle_announce(message)
+                elif command == 'get_peers':
+                    self.handle_get_peers(message)
+                # Podríamos añadir un comando 'stop' para que un peer se elimine limpiamente
+        except (json.JSONDecodeError, ConnectionResetError) as e:
+            print(f"Error de conexión/decodificación con {self.client_address}: {e}")
         except Exception as e:
-            print(f"[{time.ctime()}] Error manejando la solicitud de {self.client_address}: {e}")
+            print(f"Error inesperado manejando a {self.client_address}: {e}")
 
-class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    pass
+    def handle_announce(self, message):
+        """
+        Maneja el anuncio de un peer.
+        Actualiza el estado del peer para un torrent específico.
+        """
+        torrent_hash = message['torrent_hash']
+        peer_id = message['peer_id']
+        peer_port = message['port']
+        progress = message['progress']
+        peer_ip = self.client_address[0]
+
+        if torrent_hash not in torrents:
+            torrents[torrent_hash] = {}
+        
+        torrents[torrent_hash][peer_id] = {
+            'ip': peer_ip,
+            'port': peer_port,
+            'progress': progress,
+            'last_seen': time.time()
+        }
+        
+        # Confirma el anuncio al peer
+        response = {'status': 'ok', 'message': 'Anuncio recibido.'}
+        self.request.sendall(json.dumps(response).encode('utf-8'))
+
+    def handle_get_peers(self, message):
+        """
+        Devuelve la lista de peers que tienen un torrent.
+        """
+        torrent_hash = message['torrent_hash']
+        requesting_peer_id = message['peer_id']
+        
+        peer_list = []
+        if torrent_hash in torrents:
+            # Filtra para no incluir al peer que hace la solicitud
+            # y solo incluye a peers que tienen al menos una pieza (progress > 0)
+            all_peers = torrents[torrent_hash]
+            for pid, info in all_peers.items():
+                if pid != requesting_peer_id and info['progress'] > 0:
+                    peer_list.append({'peer_id': pid, 'ip': info['ip'], 'port': info['port']})
+        
+        response = {'peers': peer_list}
+        self.request.sendall(json.dumps(response).encode('utf-8'))
+
+def print_tracker_status():
+    """
+    Imprime el estado actual de la red en la consola del tracker.
+    Se ejecuta en un hilo separado.
+    """
+    while True:
+        with lock:
+            print("\n" + "="*60)
+            print(f"Estado del Tracker - {time.ctime()}")
+            print("="*60)
+            if not torrents:
+                print("No hay torrents activos en la red.")
+            else:
+                for torrent_hash, peers in torrents.items():
+                    print(f"\n--- Torrent: {torrent_hash[:20]}... ---")
+                    print(f"{'Peer ID':<25} {'Dirección IP:Puerto':<22} {'Progreso':<10}")
+                    print("-"*60)
+                    for peer_id, info in peers.items():
+                        # Eliminar peers inactivos
+                        if time.time() - info['last_seen'] > 60: # Inactivo por más de 60s
+                            # Esta parte debería hacerse en un hilo de limpieza separado
+                            # para no bloquear la impresión, pero por simplicidad está aquí.
+                            pass # Implementación de limpieza omitida por simplicidad
+                        
+                        progress_percent = f"{info['progress'] * 100:.1f}%"
+                        status = "Seeder" if info['progress'] == 1.0 else "Leecher"
+                        print(f"{peer_id:<25} {f'{info["ip"]}:{info["port"]}':<22} {progress_percent:<10} ({status})")
+        
+        time.sleep(10) # Actualizar cada 10 segundos
+
 
 if __name__ == "__main__":
-    print(f"[*] Tracker iniciado en {TRACKER_HOST}:{TRACKER_PORT}")
-    
-    # --- Iniciar el hilo para mostrar el estado ---
-    status_thread = threading.Thread(target=display_tracker_status)
-    status_thread.daemon = True
+    if len(sys.argv) != 2:
+        print("Uso: python tracker.py <puerto>")
+        sys.exit(1)
+        
+    try:
+        port = int(sys.argv[1])
+    except ValueError:
+        print("Error: El puerto debe ser un número.")
+        sys.exit(1)
+
+    # Iniciar el hilo que imprime el estado
+    status_thread = threading.Thread(target=print_tracker_status, daemon=True)
     status_thread.start()
-    # ----------------------------------------------
-    
-    server = ThreadingTCPServer((TRACKER_HOST, TRACKER_PORT), TorrentRequestHandler)
+
+    # Usamos ThreadingTCPServer para manejar cada conexión en un nuevo hilo
+    server = socketserver.ThreadingTCPServer((TRACKER_HOST, port), TrackerHandler)
+    print(f"Tracker iniciado en {TRACKER_HOST}:{port}. Esperando conexiones...")
     
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[*] Cerrando el tracker.")
+        print("\nCerrando el tracker...")
         server.shutdown()
         server.server_close()
