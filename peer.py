@@ -163,12 +163,23 @@ class Peer:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(TRACKER_ADDRESS)
+
+                # --- MODIFICACIÓN AQUÍ ---
+                # Calcular el progreso actual
+                pieces_owned = self.pieces_i_have.count(True)
+                # -------------------------
+
                 message = {
-                    'action': 'announce',
-                    'torrent_hash': self.torrent_hash,
-                    'port': self.my_port,
-                    'peer_id': self.peer_id
+                'action': 'announce',
+                'torrent_hash': self.torrent_hash,
+                'port': self.my_port,
+                'peer_id': self.peer_id,
+                # --- NUEVOS DATOS AÑADIDOS ---
+                'num_pieces_owned': pieces_owned,
+                'total_pieces': self.num_pieces
+                # -----------------------------
                 }
+
                 s.sendall(json.dumps(message).encode('utf-8'))
                 
                 response_data = s.recv(4096)
