@@ -7,13 +7,27 @@ import sys
 import threading
 import time
 import random
+import socket
+import requests
 from config import TRACKER_ADDRESS, PIECE_SIZE, TRACKER_ANNOUNCE_INTERVAL
+
+def get_public_ip():
+    """
+    Obtiene la IP pública consultando un servicio externo.
+    Requiere instalar 'requests': pip install requests
+    """
+    try:
+        response = requests.get('https://api.ipify.org?format=json', timeout=5)
+        response.raise_for_status()
+        return response.json()['ip']
+    except requests.RequestException as e:
+        return f"Error al obtener IP pública: {e}"
 
 class Peer:
     def __init__(self, torrent_file, my_port):
         self.torrent_file = torrent_file
         self.my_port = my_port
-        self.my_ip = 'localhost' # O usa una función para obtener la IP pública/local
+        self.my_ip = get_public_ip()
         self.load_torrent_data()
         self.init_download_state()
         self.peer_id = self.generate_peer_id()
