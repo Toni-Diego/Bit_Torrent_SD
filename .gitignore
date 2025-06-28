@@ -1,2 +1,4 @@
 # .gitignore
 .env
+/downloads
+/__pycache__

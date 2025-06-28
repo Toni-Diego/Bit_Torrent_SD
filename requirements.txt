@@ -1,0 +1,5 @@
+# Instalar todo
+#pip install -r requirements.txt
+requests
+python-dotenv
+#sudo apt install python3-requests python3-dotenv
