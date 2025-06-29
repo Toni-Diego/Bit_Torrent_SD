@@ -63,10 +63,10 @@ class Peer:
                     print("Error: El archivo no existe.")
             elif choice == '2':
                 torrent_path = input("Introduce la ruta del archivo .torrent para descargar: ")
-                if os.path.exists(torrent_path):
-                    self.start_download(torrent_path)
-                else:
-                    print("Error: El archivo .torrent no existe.")
+                #if os.path.exists(torrent_path): #Mal porque nunca va a existir la ruta, es una ruta externa
+                self.start_download(torrent_path)
+                # else:
+                #     print("Error: El archivo .torrent no existe.")
             elif choice == '3':
                 self.show_status()
             elif choice == '4':
