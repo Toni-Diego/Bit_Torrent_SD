@@ -1,4 +1,5 @@
 # peer.py (Corregido con anuncio inmediato)
+# peer.py (Rediseñado para descubrir y descargar torrents de la red)
 import socket
 import threading
 import json
@@ -27,94 +28,159 @@ class Peer:
         print(f"Peer iniciado con ID: {self.peer_id}")
         print(f"IP detectada: {self.my_ip}")
         
-        server_thread = threading.Thread(target=self.run_server, daemon=True)
-        server_thread.start()
-
-        announcer_thread = threading.Thread(target=self.periodic_announce, daemon=True)
-        announcer_thread.start()
-
+        server_thread = threading.Thread(target=self.run_server, daemon=True); server_thread.start()
+        announcer_thread = threading.Thread(target=self.periodic_announce, daemon=True); announcer_thread.start()
         self.main_menu()
 
     def main_menu(self):
         while not self.stop_event.is_set():
             print("\n--- Menú Principal ---")
-            print("1. Compartir un nuevo archivo (crear .torrent)")
-            print("2. Descargar un archivo (usar .torrent)")
-            print("3. Ver estado de descargas y subidas")
+            print("1. Compartir un nuevo archivo")
+            print("2. Descargar un archivo de la red")
+            print("3. Ver estado de actividad")
             print("4. Salir")
             choice = input("Selecciona una opción: ")
 
-            if choice == '1':
-                file_path = input("Introduce la ruta completa del archivo a compartir: ")
-                if os.path.exists(file_path):
-                    torrent_file = create_torrent_file(file_path)
-                    if torrent_file:
-                        torrent_data = load_torrent_file(torrent_file)
-                        if torrent_data:
-                            torrent_hash = torrent_data['torrent_hash']
-                            with self.lock:
-                                self.seeding_torrents[torrent_hash] = {
-                                    'metadata': torrent_data,
-                                    'local_path': file_path
-                                }
-                            print(f"Archivo '{torrent_data['file_name']}' ahora está siendo compartido.")
-                            self.announce_once(torrent_hash, 1.0) # Anuncio inmediato
-                else:
-                    print("Error: El archivo no existe.")
-            elif choice == '2':
-                torrent_path = input("Introduce la ruta del archivo .torrent para descargar: ")
-                #if os.path.exists(torrent_path): #Mal porque nunca va a existir la ruta, es una ruta externa
-                self.start_download(torrent_path)
-                # else:
-                #     print("Error: El archivo .torrent no existe.")
-            elif choice == '3':
-                self.show_status()
+            if choice == '1': self.share_new_file()
+            elif choice == '2': self.download_from_network()
+            elif choice == '3': self.show_status()
             elif choice == '4':
-                print("Cerrando peer...")
-                self.stop_event.set()
-                break
-            else:
-                print("Opción no válida.")
+                print("Cerrando peer..."); self.stop_event.set(); break
+            else: print("Opción no válida.")
 
-    def announce_once(self, torrent_hash, progress):
-        """Realiza un único anuncio al tracker para un torrent específico."""
+    def share_new_file(self):
+        file_path = input("Introduce la ruta completa del archivo a compartir: ")
+        if not os.path.exists(file_path):
+            print("Error: El archivo no existe."); return
+        
+        # Ya no necesitamos el archivo .torrent, solo los metadatos en memoria
+        print("Creando metadatos del torrent...")
+        torrent_metadata = self.create_torrent_metadata(file_path)
+        if not torrent_metadata:
+            print("Error al crear los metadatos."); return
+        
+        torrent_hash = torrent_metadata['torrent_hash']
+        with self.lock:
+            self.seeding_torrents[torrent_hash] = {
+                'metadata': torrent_metadata, 'local_path': file_path
+            }
+        print(f"Archivo '{torrent_metadata['file_name']}' ahora está siendo compartido.")
+        # Anuncio inmediato con metadatos
+        self.announce_once(torrent_hash, 1.0, torrent_metadata)
+
+    def download_from_network(self):
+        print("Obteniendo lista de archivos de la red...")
+        available_torrents = self.request_from_tracker({'command': 'list_torrents'})
+        
+        if not available_torrents or 'torrents' not in available_torrents or not available_torrents['torrents']:
+            print("No hay archivos disponibles en la red o no se pudo contactar al tracker."); return
+
+        print("\n--- Archivos Disponibles en la Red ---")
+        torrents_list = available_torrents['torrents']
+        for i, t in enumerate(torrents_list):
+            size_mb = t['file_size'] / (1024 * 1024)
+            print(f"{i+1}. {t['file_name']} ({size_mb:.2f} MB) - Seeders: {t['seeders']}, Leechers: {t['leechers']}")
+        
+        try:
+            choice = int(input("Elige el número del archivo a descargar (0 para cancelar): "))
+            if choice == 0 or choice > len(torrents_list): return
+            
+            selected_torrent_info = torrents_list[choice-1]
+            torrent_hash = selected_torrent_info['torrent_hash']
+
+            # Verificar si ya lo tenemos o lo estamos descargando
+            with self.lock:
+                if torrent_hash in self.seeding_torrents or torrent_hash in self.downloading_torrents:
+                    print("Ya tienes o estás descargando este archivo."); return
+
+            print(f"Obteniendo metadatos para '{selected_torrent_info['file_name']}'...")
+            response = self.request_from_tracker({'command': 'get_torrent_metadata', 'torrent_hash': torrent_hash})
+            
+            if not response or 'metadata' not in response:
+                print("Error: No se pudieron obtener los metadatos del tracker."); return
+            
+            torrent_metadata = response['metadata']
+            self.start_download(torrent_metadata)
+
+        except (ValueError, IndexError):
+            print("Selección no válida.")
+    
+    def announce_once(self, torrent_hash, progress, metadata=None):
+        message = {
+            'command': 'announce', 'torrent_hash': torrent_hash,
+            'peer_id': self.peer_id, 'port': self.server_port,
+            'progress': progress
+        }
+        if metadata:
+            message['metadata'] = metadata
+        
+        response = self.request_from_tracker(message)
+        if response:
+            print(f"[INFO] Anuncio para {torrent_hash[:10]}... enviado al tracker.")
+        else:
+            print(f"[ERROR] Anuncio para {torrent_hash[:10]}... falló.")
+
+    def periodic_announce(self):
+        while not self.stop_event.is_set():
+            time.sleep(TRACKER_ANNOUNCE_INTERVAL)
+            with self.lock:
+                all_hashes = list(self.seeding_torrents.keys()) + list(self.downloading_torrents.keys())
+            
+            for thash in set(all_hashes):
+                progress = 1.0
+                if thash in self.downloading_torrents:
+                    progress = self.downloading_torrents[thash].get_progress()
+                # En anuncios periódicos ya no enviamos metadatos
+                self.announce_once(thash, progress)
+    
+    def start_download(self, torrent_metadata):
+        torrent_hash = torrent_metadata['torrent_hash']
+        with self.lock:
+            if torrent_hash in self.downloading_torrents or torrent_hash in self.seeding_torrents:
+                print("Ya estás manejando este archivo."); return
+            
+            download_manager = DownloadManager(torrent_metadata, self.peer_id, self.request_from_tracker)
+            self.downloading_torrents[torrent_hash] = download_manager
+
+        initial_progress = download_manager.get_progress()
+        self.announce_once(torrent_hash, initial_progress)
+
+        download_thread = threading.Thread(target=download_manager.start, args=(self.stop_event, self.lock, self.seeding_torrents, self.downloading_torrents, self.announce_once), daemon=True)
+        download_thread.start()
+        print(f"Descarga iniciada para '{torrent_metadata['file_name']}'.")
+
+    # --- Funciones de utilidad y servidor (sin cambios mayores) ---
+    def request_from_tracker(self, message):
+        """Función centralizada para todas las peticiones al tracker."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(5)
                 s.connect(TRACKER_ADDRESS)
-                message = {
-                    'command': 'announce',
-                    'torrent_hash': torrent_hash,
-                    'peer_id': self.peer_id,
-                    'port': self.server_port,
-                    'progress': progress
-                }
                 s.sendall(json.dumps(message).encode('utf-8'))
-                s.recv(1024)
-                print(f"[INFO] Anuncio enviado al tracker para {torrent_hash[:10]}...")
-                return True
-        except Exception as e:
-            print(f"[ERROR] No se pudo contactar al tracker: {e}")
-            return False
-
-    def periodic_announce(self):
-        """Contacta al tracker periódicamente para anunciar todos los torrents activos."""
-        while not self.stop_event.is_set():
-            time.sleep(TRACKER_ANNOUNCE_INTERVAL)
-            with self.lock:
-                all_torrents = []
-                for thash, info in self.seeding_torrents.items():
-                    all_torrents.append((thash, 1.0))
-                for thash, dm in self.downloading_torrents.items():
-                    if thash not in self.seeding_torrents:
-                        all_torrents.append((thash, dm.get_progress()))
+                response_data = s.recv(8192) # Aumentar buffer para metadatos
+                return json.loads(response_data.decode('utf-8'))
+        except (socket.timeout, ConnectionRefusedError, json.JSONDecodeError) as e:
+            # print(f"[ERROR] No se pudo comunicar con el tracker: {e}")
+            return None
+    
+    def create_torrent_metadata(self, file_path):
+        try:
+            file_size = os.path.getsize(file_path)
+            pieces_hashes = []
+            with open(file_path, 'rb') as f:
+                while True:
+                    piece = f.read(PIECE_SIZE)
+                    if not piece: break
+                    pieces_hashes.append(hashlib.sha1(piece).hexdigest())
             
-            if not all_torrents:
-                continue
-
-            # print(f"\n[INFO] Anuncio periódico para {len(all_torrents)} torrent(s)...")
-            for torrent_hash, progress in all_torrents:
-                self.announce_once(torrent_hash, progress)
+            torrent_hash = hashlib.sha1(str(pieces_hashes).encode()).hexdigest()
+            return {
+                'file_name': os.path.basename(file_path), 'file_size': file_size,
+                'piece_size': PIECE_SIZE, 'pieces_hashes': pieces_hashes,
+                'torrent_hash': torrent_hash
+            }
+        except Exception as e:
+            print(f"Error creando metadatos: {e}"); return None
 
     def run_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -177,25 +243,6 @@ class Peer:
                 return f.read(piece_size)
         return None
 
-    def start_download(self, torrent_path):
-        torrent_data = load_torrent_file(torrent_path)
-        if not torrent_data: return
-        
-        torrent_hash = torrent_data['torrent_hash']
-        with self.lock:
-            if torrent_hash in self.downloading_torrents or torrent_hash in self.seeding_torrents:
-                print("Ya estás manejando este archivo.")
-                return
-            download_manager = DownloadManager(torrent_data, self.peer_id)
-            self.downloading_torrents[torrent_hash] = download_manager
-
-        initial_progress = download_manager.get_progress()
-        self.announce_once(torrent_hash, initial_progress)
-
-        download_thread = threading.Thread(target=download_manager.start, args=(self.stop_event, self.lock, self.seeding_torrents, self.downloading_torrents), daemon=True)
-        download_thread.start()
-        print(f"Descarga iniciada para '{torrent_data['file_name']}'.")
-
     def show_status(self):
         print("\n--- Estado del Peer ---")
         with self.lock:
@@ -214,9 +261,10 @@ class Peer:
 
 class DownloadManager:
     """Gestiona la descarga de un único torrent."""
-    def __init__(self, torrent_data, peer_id):
+    def __init__(self, torrent_data, peer_id, tracker_requester):
         self.torrent_data = torrent_data
         self.peer_id = peer_id
+        self.tracker_requester = tracker_requester # Pasa la función para contactar al tracker
         self.total_pieces = len(torrent_data['pieces_hashes'])
         self.output_path = os.path.join("./downloads", torrent_data['file_name'])
         self.state_path = self.output_path + DOWNLOAD_STATE_EXTENSION
@@ -262,7 +310,7 @@ class DownloadManager:
     def print_progress(self):
         self.pbar.refresh()
 
-    def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents):
+    def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents): #, announce_func
         while self.needed_pieces and not stop_event.is_set():
             peers = self.get_peers_from_tracker()
             if not peers:
@@ -287,6 +335,7 @@ class DownloadManager:
         
         self.pbar.close()
         if not self.needed_pieces:
+            #announce_once_dm(self.torrent_data['torrent_hash'], 1.0)
             print(f"\n¡Descarga completa para '{self.torrent_data['file_name']}'!")
             if os.path.exists(self.state_path): os.remove(self.state_path)
             with global_lock:
@@ -324,17 +373,10 @@ class DownloadManager:
         self.pbar.update(1)
 
     def get_peers_from_tracker(self):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5)
-                s.connect(TRACKER_ADDRESS)
-                s.sendall(json.dumps({
-                    'command': 'get_peers', 'torrent_hash': self.torrent_data['torrent_hash'], 'peer_id': self.peer_id
-                }).encode('utf-8'))
-                response = json.loads(s.recv(4096).decode('utf-8'))
-                return response.get('peers', [])
-        except Exception:
-            return []
+        """Obtiene la lista de peers del tracker."""
+        message = {'command': 'get_peers', 'torrent_hash': self.torrent_data['torrent_hash'], 'peer_id': self.peer_id}
+        response = self.tracker_requester(message)
+        return response.get('peers', []) if response else []
 
     def download_piece(self, peer_info, piece_index):
         try:
