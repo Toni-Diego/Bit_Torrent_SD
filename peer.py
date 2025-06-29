@@ -8,6 +8,7 @@ import time
 import hashlib
 import uuid
 from tqdm import tqdm
+import random # ### NUEVO: Necesario para elegir peers al azar
 
 from config import PIECE_SIZE, TRACKER_ADDRESS, TRACKER_ANNOUNCE_INTERVAL, DOWNLOAD_STATE_EXTENSION
 from utils import create_torrent_file, load_torrent_file, get_public_ip
@@ -341,29 +342,30 @@ class DownloadManager:
         
         self.have_pieces = set()
         self.needed_pieces = set(range(self.total_pieces))
+        ### NUEVO: Conjunto para piezas que ya se están descargando ###
+        self.pieces_in_progress = set()
         self.lock = threading.Lock()
 
         # Guardará -> {'ip:puerto': ultimo_tiempo_de_descarga}
         self.active_download_sources = {}
+        ### NUEVO: Límite de descargas paralelas ###
+        self.MAX_CONCURRENT_DOWNLOADS = 8
         
         self.pbar = tqdm(total=self.total_pieces, unit='piece', desc=f"DL {torrent_data['file_name'][:15]}..", leave=False)
 
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
-        self.load_state_or_initialize() ### CAMBIO: Lógica de carga/inicialización centralizada
+        self.load_state_or_initialize()
 
-    ### CAMBIO: Lógica unificada para cargar estado o inicializar un nuevo archivo
     def load_state_or_initialize(self):
         if os.path.exists(self.state_path):
             try:
                 with open(self.state_path, 'r') as f:
                     state = json.load(f)
-                # Comprobación de integridad
                 if state['metadata']['torrent_hash'] == self.torrent_data['torrent_hash']:
                     self.have_pieces = set(state.get('have_pieces', []))
                     self.needed_pieces -= self.have_pieces
                     self.pbar.update(len(self.have_pieces))
                 else:
-                    # Archivo de estado no coincide, empezar de cero
                     self.create_empty_file_and_state()
             except (json.JSONDecodeError, FileNotFoundError, KeyError):
                 self.create_empty_file_and_state()
@@ -371,16 +373,12 @@ class DownloadManager:
             self.create_empty_file_and_state()
 
     def create_empty_file_and_state(self):
-        """Crea el archivo de salida vacío y el archivo de estado inicial."""
-        # Crear el archivo en disco con el tamaño final para poder escribir piezas en cualquier posición
         with open(self.output_path, 'wb') as f:
             if self.torrent_data['file_size'] > 0:
                 f.seek(self.torrent_data['file_size'] - 1)
                 f.write(b'\0')
-        # Guardar el estado inicial (con metadatos pero sin piezas)
         self.save_state()
 
-    ### CAMBIO: Guardar metadatos junto con las piezas
     def save_state(self):
         with self.lock:
             state_data = {
@@ -398,59 +396,63 @@ class DownloadManager:
         self.pbar.refresh()
 
     def get_active_sources(self, timeout=30):
-        """
-        Devuelve una lista de direcciones de peers de los que se ha descargado
-        algo en el último 'timeout' en segundos.
-        """
         with self.lock:
             now = time.time()
-            # Filtramos para quedarnos solo con las fuentes recientes
             recent_sources = [
                 addr for addr, last_seen in self.active_download_sources.items()
                 if now - last_seen < timeout
             ]
             return recent_sources
 
+    ### CAMBIO FUNDAMENTAL: El método start ahora gestiona workers ###
     def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents, announce_func):
-        while len(self.needed_pieces) > 0 and not stop_event.is_set():
+        worker_threads = []
+
+        # El bucle principal continúa mientras no hayamos completado todas las piezas
+        while len(self.have_pieces) < self.total_pieces and not stop_event.is_set():
+            # Limpiar hilos que ya terminaron
+            worker_threads = [t for t in worker_threads if t.is_alive()]
+
             peers = self.get_peers_from_tracker()
             if not peers:
-                time.sleep(10)
+                time.sleep(5)
                 continue
-            
-            try:
-                # Tomar una pieza de las que se necesitan
-                piece_to_download = self.needed_pieces.pop()
-            except KeyError:
-                break # No quedan piezas
 
-            piece_data = None
-            # Iterar sobre los peers para encontrar uno que tenga la pieza
-            for peer in peers:
-                # Evitar conectarse a uno mismo
-                if peer['ip'] == get_public_ip() and peer['port'] == int(self.peer_id.split(':')[1].split('-')[0]):
-                    continue
+            # Lanzar nuevos workers si hay espacio y piezas disponibles
+            with self.lock:
+                num_workers_to_start = self.MAX_CONCURRENT_DOWNLOADS - len(worker_threads)
                 
-                piece_data = self.download_piece(peer, piece_to_download)
-                if piece_data:
-                    ### CAMBIO: Registrar la fuente si la descarga fue exitosa ###
-                    with self.lock:
-                        peer_address = f"{peer['ip']}:{peer['port']}"
-                        self.active_download_sources[peer_address] = time.time()
-                    break
-            
-            if piece_data:
-                # Si se descargó, escribirla y actualizar estado
-                self.write_piece(piece_to_download, piece_data)
-            else:
-                # Si no se pudo descargar, devolverla a la lista de necesitadas
-                self.needed_pieces.add(piece_to_download)
-                time.sleep(2)
-        
+                # Barajar la lista de piezas necesarias para no pedirlas siempre en orden
+                available_pieces = list(self.needed_pieces - self.pieces_in_progress)
+                random.shuffle(available_pieces)
+
+            for piece_to_download in available_pieces[:num_workers_to_start]:
+                # Asignar la pieza a un worker
+                with self.lock:
+                    self.pieces_in_progress.add(piece_to_download)
+                
+                # Elegir un peer al azar para esta pieza
+                peer = random.choice(peers)
+
+                # Crear y lanzar el hilo worker
+                worker = threading.Thread(
+                    target=self._worker_download_piece, 
+                    args=(piece_to_download, peer), 
+                    daemon=True
+                )
+                worker.start()
+                worker_threads.append(worker)
+
+            time.sleep(0.1) # Pequeña pausa para no saturar la CPU
+
+        # Esperar a que los últimos workers terminen
+        for t in worker_threads:
+            t.join()
+
         self.pbar.close()
-        if not self.needed_pieces:
+        # El resto de la lógica de finalización es la misma
+        if not self.needed_pieces and not self.pieces_in_progress:
             print(f"\n¡Descarga completa para '{self.torrent_data['file_name']}'!")
-            # Limpiar archivo de estado y mover de "descargando" a "seeding"
             if os.path.exists(self.state_path):
                 os.remove(self.state_path)
             
@@ -462,7 +464,6 @@ class DownloadManager:
                     'metadata': self.torrent_data,
                     'local_path': self.output_path
                 }
-            # Anunciar al tracker que ahora es un seeder (progreso 1.0)
             announce_func(self.torrent_data['torrent_hash'], 1.0)
         else:
             if not stop_event.is_set():
@@ -470,17 +471,37 @@ class DownloadManager:
             else:
                 print(f"\nDescarga para '{self.torrent_data['file_name']}' interrumpida.")
 
+    ### NUEVO: Función que ejecuta cada worker thread ###
+    def _worker_download_piece(self, piece_index, peer_info):
+        # Evitar conectarse a uno mismo (doble verificación)
+        if peer_info['ip'] == get_public_ip() and peer_info['port'] == int(self.peer_id.split(':')[1].split('-')[0]):
+            with self.lock:
+                self.pieces_in_progress.remove(piece_index)
+            return
 
+        piece_data = self.download_piece(peer_info, piece_index)
+        
+        if piece_data:
+            # Éxito: Escribir la pieza y actualizar estado
+            self.write_piece(piece_index, piece_data)
+            with self.lock:
+                peer_address = f"{peer_info['ip']}:{peer_info['port']}"
+                self.active_download_sources[peer_address] = time.time()
+                self.pieces_in_progress.remove(piece_index) # Ya no está "en progreso", está "descargada"
+        else:
+            # Fracaso: La pieza vuelve a estar disponible para otro worker
+            with self.lock:
+                self.pieces_in_progress.remove(piece_index)
+    
     def write_piece(self, index, data):
-        # Usar 'r+b' para escribir en un archivo existente sin truncarlo
         with open(self.output_path, 'r+b') as f:
             f.seek(index * self.torrent_data['piece_size'])
             f.write(data)
         
         with self.lock:
             self.have_pieces.add(index)
+            self.needed_pieces.discard(index) # Eliminar de las necesitadas
         
-        # Guardar el estado después de cada pieza para máxima resiliencia
         self.save_state()
         self.pbar.update(1)
 
@@ -502,7 +523,7 @@ class DownloadManager:
 
                 piece_data = b''
                 piece_size = self.torrent_data['piece_size']
-                if piece_index == self.total_pieces - 1: # Última pieza
+                if piece_index == self.total_pieces - 1:
                     expected_size = self.torrent_data['file_size'] % piece_size
                     if expected_size == 0: expected_size = piece_size
                 else:
@@ -514,7 +535,6 @@ class DownloadManager:
                     if not chunk: return None
                     piece_data += chunk
                 
-                # Verificar la integridad de la pieza
                 if hashlib.sha1(piece_data).hexdigest() == self.torrent_data['pieces_hashes'][piece_index]:
                     return piece_data
                 else:
