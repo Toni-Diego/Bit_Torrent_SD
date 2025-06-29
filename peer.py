@@ -1,4 +1,4 @@
-# peer.py (Corregido y Refactorizado)
+# peer.py (Corregido con rutas absolutas y mejor logging de errores)
 import socket
 import threading
 import json
@@ -26,8 +26,6 @@ class Peer:
     def start(self):
         print(f"Peer iniciado con ID: {self.peer_id}")
         print(f"IP detectada: {self.my_ip}")
-
-        # La reanudación de descargas ahora es más robusta
         self.load_incomplete_downloads()
         
         server_thread = threading.Thread(target=self.run_server, daemon=True)
@@ -39,7 +37,6 @@ class Peer:
         self.main_menu()
 
     def load_incomplete_downloads(self):
-        """Escanea la carpeta de descargas en busca de archivos .state para reanudar."""
         print("Buscando descargas incompletas para reanudar...")
         downloads_dir = "./downloads"
         if not os.path.exists(downloads_dir):
@@ -57,13 +54,10 @@ class Peer:
                         metadata = state_data['metadata']
                         torrent_hash = metadata['torrent_hash']
                         
-                        # Evitar cargar algo que ya está completo
                         if os.path.exists(os.path.join(downloads_dir, metadata['file_name'])) and torrent_hash in self.seeding_torrents:
                             continue
 
                         print(f"Reanudando descarga para: {metadata['file_name']}")
-                        ### CAMBIO: La llamada a start_download se simplifica.
-                        # Ya no pasamos las piezas, el DownloadManager se encargará de leer su propio estado.
                         self.start_download(metadata)
 
                 except (json.JSONDecodeError, KeyError, FileNotFoundError) as e:
@@ -86,9 +80,13 @@ class Peer:
             else: print("Opción no válida.")
 
     def share_new_file(self):
-        file_path = input("Introduce la ruta completa del archivo a compartir: ")
+        file_path_input = input("Introduce la ruta del archivo a compartir: ")
+        
+        ### CORRECCIÓN CLAVE 1: Convertir la ruta a absoluta para evitar errores de directorio.
+        file_path = os.path.abspath(file_path_input)
+
         if not os.path.exists(file_path):
-            print("Error: El archivo no existe."); return
+            print(f"Error: El archivo no existe en la ruta '{file_path}'."); return
         
         print("Creando metadatos del torrent...")
         torrent_metadata = self.create_torrent_metadata(file_path)
@@ -100,7 +98,7 @@ class Peer:
             self.seeding_torrents[torrent_hash] = {
                 'metadata': torrent_metadata, 'local_path': file_path
             }
-        print(f"Archivo '{torrent_metadata['file_name']}' ahora está siendo compartido.")
+        print(f"Archivo '{torrent_metadata['file_name']}' ahora está siendo compartido desde '{file_path}'.")
         self.announce_once(torrent_hash, 1.0, torrent_metadata)
 
     def download_from_network(self):
@@ -149,40 +147,38 @@ class Peer:
             message['metadata'] = metadata
         
         response = self.request_from_tracker(message)
-        if response and progress < 1.0: # No imprimir para anuncios periodicos de seeder
+        if response and progress < 1.0:
             print(f"[INFO] Anuncio para {torrent_hash[:10]}... enviado al tracker.")
         elif not response:
             print(f"[ERROR] Anuncio para {torrent_hash[:10]}... falló.")
 
     def periodic_announce(self):
         while not self.stop_event.is_set():
-            time.sleep(TRACKER_ANNOUNCE_INTERVAL)
             with self.lock:
                 all_hashes = list(self.seeding_torrents.keys()) + list(self.downloading_torrents.keys())
             
             for thash in set(all_hashes):
                 progress = 1.0
                 if thash in self.downloading_torrents:
-                    # Usar try-except por si el torrent se elimina justo en este momento
                     try:
                         progress = self.downloading_torrents[thash].get_progress()
                     except KeyError:
                         continue
                 self.announce_once(thash, progress)
+            
+            time.sleep(TRACKER_ANNOUNCE_INTERVAL)
 
-    ### CAMBIO: La función se simplifica, ya no necesita `initial_pieces`.
+
     def start_download(self, torrent_metadata):
         torrent_hash = torrent_metadata['torrent_hash']
         with self.lock:
             if torrent_hash in self.downloading_torrents or torrent_hash in self.seeding_torrents:
                 return 
             
-            ### CAMBIO: La creación del DownloadManager es más simple.
             download_manager = DownloadManager(torrent_metadata, self.peer_id, self.request_from_tracker)
             self.downloading_torrents[torrent_hash] = download_manager
 
         initial_progress = download_manager.get_progress()
-        # Anunciar al tracker que hemos empezado la descarga
         self.announce_once(torrent_hash, initial_progress)
 
         download_thread = threading.Thread(
@@ -201,7 +197,7 @@ class Peer:
                 s.sendall(json.dumps(message).encode('utf-8'))
                 response_data = s.recv(8192) 
                 return json.loads(response_data.decode('utf-8'))
-        except (socket.timeout, ConnectionRefusedError, json.JSONDecodeError):
+        except (socket.timeout, ConnectionRefusedError, json.JSONDecodeError, OSError):
             return None
     
     def create_torrent_metadata(self, file_path):
@@ -257,32 +253,40 @@ class Peer:
                     with self.lock:
                         dm = self.downloading_torrents.get(torrent_hash)
                     if dm and piece_index in dm.have_pieces:
-                        file_path = dm.output_path
-                        piece_size = dm.torrent_data['piece_size']
-                        with open(file_path, 'rb') as f:
-                            f.seek(piece_index * piece_size)
-                            piece_data = f.read(piece_size)
+                        piece_data = self.get_piece_from_storage(self.downloading_torrents, torrent_hash, piece_index)
                 
                 if piece_data:
                     client_socket.sendall(piece_data)
-        except Exception:
-            pass
+
+        ### CORRECCIÓN CLAVE 2: Loggear el error en lugar de ignorarlo silenciosamente.
+        except Exception as e:
+            print(f"[ERROR] En handle_peer_request de {addr}: {e}")
         finally:
             client_socket.close()
 
     def get_piece_from_storage(self, storage, torrent_hash, piece_index):
         with self.lock:
-            info = storage.get(torrent_hash)
-        if info:
-            file_path = info['local_path']
-            piece_size = info['metadata']['piece_size']
-            try:
-                with open(file_path, 'rb') as f:
-                    f.seek(piece_index * piece_size)
-                    return f.read(piece_size)
-            except FileNotFoundError:
-                return None
-        return None
+            # Para los downloading_torrents, el 'info' es el propio DownloadManager
+            if isinstance(storage.get(torrent_hash), DownloadManager):
+                info = storage[torrent_hash].torrent_data
+                file_path = storage[torrent_hash].output_path
+                piece_size = info['piece_size']
+            else: # Para seeding_torrents, es un diccionario
+                info = storage.get(torrent_hash)
+                if not info: return None
+                file_path = info['local_path']
+                piece_size = info['metadata']['piece_size']
+        
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(piece_index * piece_size)
+                return f.read(piece_size)
+        except FileNotFoundError:
+            print(f"[ERROR SEEDER] No se encontró el archivo '{file_path}' al intentar servir la pieza {piece_index}.")
+            return None
+        except Exception as e:
+            print(f"[ERROR SEEDER] Error leyendo pieza {piece_index} de '{file_path}': {e}")
+            return None
 
     def show_status(self):
         print("\n--- Estado del Peer ---")
@@ -290,7 +294,7 @@ class Peer:
             if self.seeding_torrents:
                 print("\nArchivos compartiendo (Seed):")
                 for _, info in self.seeding_torrents.items():
-                    print(f"  - {info['metadata']['file_name']} (Completo)")
+                    print(f"  - {info['metadata']['file_name']} (Completo) en '{info['local_path']}'")
             
             if self.downloading_torrents:
                 print("\nArchivos descargando (Leech):")
@@ -300,8 +304,8 @@ class Peer:
             if not self.seeding_torrents and not self.downloading_torrents:
                 print("No hay actividad de archivos.")
 
+
 class DownloadManager:
-    ### CAMBIO: La clase DownloadManager ha sido refactorizada significativamente.
     def __init__(self, torrent_data, peer_id, tracker_requester):
         self.torrent_data = torrent_data
         self.peer_id = peer_id
@@ -311,23 +315,19 @@ class DownloadManager:
         self.state_path = self.output_path + DOWNLOAD_STATE_EXTENSION
         self.lock = threading.Lock()
         
-        # Lógica de carga de estado unificada aquí
         self.have_pieces = self._load_state_from_file()
         self.needed_pieces = set(range(self.total_pieces)) - self.have_pieces
         
-        self.pbar = tqdm(total=self.total_pieces, unit='piece', desc=f"DL {torrent_data['file_name'][:15]}..", leave=False)
-        self.pbar.update(len(self.have_pieces))
-
+        self.pbar = tqdm(total=self.total_pieces, unit='piece', desc=f"DL {torrent_data['file_name'][:15]}..", leave=False, initial=len(self.have_pieces))
+        
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
         if not os.path.exists(self.output_path):
             self._create_empty_file()
         
-        # Guardar el estado solo si es una descarga nueva (no tenemos piezas)
         if not self.have_pieces:
             self.save_state()
 
     def _load_state_from_file(self):
-        """Carga las piezas que ya tenemos desde el archivo .state."""
         if os.path.exists(self.state_path):
             try:
                 with open(self.state_path, 'r') as f:
@@ -335,25 +335,23 @@ class DownloadManager:
                 if state.get('metadata', {}).get('torrent_hash') == self.torrent_data['torrent_hash']:
                     return set(state.get('have_pieces', []))
             except (json.JSONDecodeError, FileNotFoundError):
-                pass # El archivo está corrupto o no se encuentra, empezamos de cero.
+                pass 
         return set()
 
     def _create_empty_file(self):
-        """Crea un archivo vacío del tamaño correcto para la descarga."""
         with open(self.output_path, 'wb') as f:
             if self.torrent_data['file_size'] > 0:
                 f.seek(self.torrent_data['file_size'] - 1)
                 f.write(b'\0')
 
     def save_state(self):
-        """Guarda el estado actual de la descarga (metadatos y piezas poseídas)."""
         with self.lock:
             state_data = {
                 'metadata': self.torrent_data,
                 'have_pieces': list(self.have_pieces)
             }
-            with open(self.state_path, 'w') as f:
-                json.dump(state_data, f)
+        with open(self.state_path, 'w') as f:
+            json.dump(state_data, f)
 
     def get_progress(self):
         with self.lock:
@@ -370,20 +368,21 @@ class DownloadManager:
                 continue
             
             try:
-                piece_to_download = self.needed_pieces.pop()
-            except KeyError:
+                piece_to_download = list(self.needed_pieces)[0] # No usar pop para poder reintentar
+            except IndexError:
                 break 
 
-            piece_data = None
+            downloaded = False
             for peer in peers:
                 piece_data = self.download_piece(peer, piece_to_download)
-                if piece_data: break
+                if piece_data:
+                    self.write_piece(piece_to_download, piece_data)
+                    self.needed_pieces.remove(piece_to_download)
+                    downloaded = True
+                    break
             
-            if piece_data:
-                self.write_piece(piece_to_download, piece_data)
-            else:
-                self.needed_pieces.add(piece_to_download)
-                time.sleep(2)
+            if not downloaded:
+                time.sleep(5) # Esperar un poco más si todos los peers fallan
         
         self.pbar.close()
         if not self.needed_pieces:
@@ -397,19 +396,13 @@ class DownloadManager:
                     'local_path': self.output_path
                 }
             
-            ### CAMBIO: Usar la función de anuncio correcta y eliminar la defectuosa.
-            # Anuncia al tracker que ahora somos un seeder (progreso 1.0)
             announce_func(self.torrent_data['torrent_hash'], 1.0)
         else:
             print(f"\nDescarga para '{self.torrent_data['file_name']}' interrumpida.")
-            
-    ### CAMBIO: Se eliminó el método `announce_once_dm` que era redundante y defectuoso.
 
     def write_piece(self, index, data):
         with self.lock:
-            # Escribir solo si realmente no teníamos la pieza, para evitar trabajo innecesario
             if index not in self.have_pieces:
-                # Usar 'r+b' para escribir en un archivo existente sin truncarlo
                 with open(self.output_path, 'r+b') as f:
                     f.seek(index * self.torrent_data['piece_size'])
                     f.write(data)
@@ -440,18 +433,18 @@ class DownloadManager:
                 s.settimeout(10)
                 while len(piece_data) < expected_size:
                     chunk = s.recv(4096)
-                    if not chunk: return None # Conexión cerrada por el otro peer
+                    if not chunk: return None
                     piece_data += chunk
                 
                 if hashlib.sha1(piece_data).hexdigest() == self.torrent_data['pieces_hashes'][piece_index]:
                     return piece_data
                 else:
+                    print(f"Error de hash para la pieza {piece_index}. Descartando.")
                     return None
         except (socket.timeout, ConnectionRefusedError, OSError):
             return None
-        except Exception:
-            # Puedes añadir un print aquí para depurar errores inesperados
-            # import traceback; traceback.print_exc();
+        except Exception as e:
+            # print(f"Error inesperado en download_piece: {e}")
             return None
 
 if __name__ == "__main__":
