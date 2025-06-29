@@ -303,7 +303,7 @@ class Peer:
                 return f.read(piece_size)
         except FileNotFoundError:
             return None
-    
+
     def show_status(self):
         print("\n--- Estado del Peer ---")
         with self.lock:
@@ -320,6 +320,14 @@ class Peer:
                 print("\nArchivos descargando (Leech):")
                 for _, dm in self.downloading_torrents.items():
                     dm.print_progress()
+                    
+                    ### CAMBIO: Mostrar los peers de los que se está descargando ###
+                    active_sources = dm.get_active_sources()
+                    if active_sources:
+                        # Usamos el carácter └ para que se vea como un sub-ítem
+                        print(f"      └─ Descargando de: {', '.join(active_sources)}")
+                    else:
+                        print(f"      └─ Buscando peers activos...")
 
 
 class DownloadManager:
@@ -334,6 +342,9 @@ class DownloadManager:
         self.have_pieces = set()
         self.needed_pieces = set(range(self.total_pieces))
         self.lock = threading.Lock()
+
+        # Guardará -> {'ip:puerto': ultimo_tiempo_de_descarga}
+        self.active_download_sources = {}
         
         self.pbar = tqdm(total=self.total_pieces, unit='piece', desc=f"DL {torrent_data['file_name'][:15]}..", leave=False)
 
@@ -386,6 +397,20 @@ class DownloadManager:
     def print_progress(self):
         self.pbar.refresh()
 
+    def get_active_sources(self, timeout=30):
+        """
+        Devuelve una lista de direcciones de peers de los que se ha descargado
+        algo en el último 'timeout' en segundos.
+        """
+        with self.lock:
+            now = time.time()
+            # Filtramos para quedarnos solo con las fuentes recientes
+            recent_sources = [
+                addr for addr, last_seen in self.active_download_sources.items()
+                if now - last_seen < timeout
+            ]
+            return recent_sources
+
     def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents, announce_func):
         while len(self.needed_pieces) > 0 and not stop_event.is_set():
             peers = self.get_peers_from_tracker()
@@ -408,6 +433,10 @@ class DownloadManager:
                 
                 piece_data = self.download_piece(peer, piece_to_download)
                 if piece_data:
+                    ### CAMBIO: Registrar la fuente si la descarga fue exitosa ###
+                    with self.lock:
+                        peer_address = f"{peer['ip']}:{peer['port']}"
+                        self.active_download_sources[peer_address] = time.time()
                     break
             
             if piece_data:
