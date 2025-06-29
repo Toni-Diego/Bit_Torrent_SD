@@ -310,7 +310,7 @@ class DownloadManager:
     def print_progress(self):
         self.pbar.refresh()
 
-    def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents): #, announce_func
+    def start(self, stop_event, global_lock, seeding_torrents, downloading_torrents, announce_func): #, announce_func
         while self.needed_pieces and not stop_event.is_set():
             peers = self.get_peers_from_tracker()
             if not peers:
