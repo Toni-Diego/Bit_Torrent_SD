@@ -1,4 +1,4 @@
-# tracker.py
+# tracker.py (Corregido)
 import socketserver
 import threading
 import json
@@ -7,14 +7,6 @@ import sys
 from config import TRACKER_HOST
 
 # Estructura de datos para almacenar la información de la red.
-# Usamos un diccionario donde la clave es el hash del torrent.
-# El valor es otro diccionario con los peers.
-# {
-#   "torrent_hash_1": {
-#     "peer_id_1": {"ip": "...", "port": ..., "progress": 1.0, "last_seen": ...},
-#     "peer_id_2": {"ip": "...", "port": ..., "progress": 0.5, "last_seen": ...}
-#   }
-# }
 torrents = {}
 lock = threading.Lock()
 
@@ -37,9 +29,9 @@ class TrackerHandler(socketserver.BaseRequestHandler):
                     self.handle_announce(message)
                 elif command == 'get_peers':
                     self.handle_get_peers(message)
-                # Podríamos añadir un comando 'stop' para que un peer se elimine limpiamente
         except (json.JSONDecodeError, ConnectionResetError) as e:
-            print(f"Error de conexión/decodificación con {self.client_address}: {e}")
+            # Errores comunes que pueden ignorarse en un entorno ocupado
+            pass
         except Exception as e:
             print(f"Error inesperado manejando a {self.client_address}: {e}")
 
@@ -77,8 +69,6 @@ class TrackerHandler(socketserver.BaseRequestHandler):
         
         peer_list = []
         if torrent_hash in torrents:
-            # Filtra para no incluir al peer que hace la solicitud
-            # y solo incluye a peers que tienen al menos una pieza (progress > 0)
             all_peers = torrents[torrent_hash]
             for pid, info in all_peers.items():
                 if pid != requesting_peer_id and info['progress'] > 0:
@@ -87,6 +77,25 @@ class TrackerHandler(socketserver.BaseRequestHandler):
         response = {'peers': peer_list}
         self.request.sendall(json.dumps(response).encode('utf-8'))
 
+def clean_inactive_peers():
+    """Limpia periódicamente los peers que no se han anunciado recientemente."""
+    while True:
+        time.sleep(60) # Ejecutar cada minuto
+        with lock:
+            current_time = time.time()
+            inactive_peers_to_remove = []
+            for torrent_hash, peers in torrents.items():
+                for peer_id, info in peers.items():
+                    if current_time - info['last_seen'] > 60: # Inactivo por más de 60s
+                        inactive_peers_to_remove.append((torrent_hash, peer_id))
+            
+            for torrent_hash, peer_id in inactive_peers_to_remove:
+                if torrent_hash in torrents and peer_id in torrents[torrent_hash]:
+                    del torrents[torrent_hash][peer_id]
+                    print(f"\n[INFO] Peer inactivo {peer_id[:15]}... eliminado.")
+                if torrent_hash in torrents and not torrents[torrent_hash]:
+                    del torrents[torrent_hash]
+
 def print_tracker_status():
     """
     Imprime el estado actual de la red en la consola del tracker.
@@ -94,33 +103,32 @@ def print_tracker_status():
     """
     while True:
         with lock:
-            print("\n" + "="*60)
+            # Limpiar la consola para una visualización más clara
+            # os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n" + "="*80)
             print(f"Estado del Tracker - {time.ctime()}")
-            print("="*60)
+            print("="*80)
             if not torrents:
-                print("No hay torrents activos en la red.")
+                print("No hay torrents activos en la red. Esperando peers...")
             else:
                 for torrent_hash, peers in torrents.items():
-                    print(f"\n--- Torrent: {torrent_hash[:20]}... ---")
-                    print(f"{'Peer ID':<25} {'Dirección IP:Puerto':<22} {'Progreso':<10}")
-                    print("-"*60)
+                    print(f"\n--- Torrent: {torrent_hash[:30]}... ({len(peers)} peers) ---")
+                    print(f"{'Peer ID':<35} {'Dirección IP:Puerto':<22} {'Progreso':<15}")
+                    print("-" * 80)
                     for peer_id, info in peers.items():
-                        # Eliminar peers inactivos
-                        if time.time() - info['last_seen'] > 60: # Inactivo por más de 60s
-                            # Esta parte debería hacerse en un hilo de limpieza separado
-                            # para no bloquear la impresión, pero por simplicidad está aquí.
-                            pass # Implementación de limpieza omitida por simplicidad
-                        
                         progress_percent = f"{info['progress'] * 100:.1f}%"
                         status = "Seeder" if info['progress'] == 1.0 else "Leecher"
-                        print(f"{peer_id:<25} {f'{info["ip"]}:{info["port"]}':<22} {progress_percent:<10} ({status})")
+                        
+                        # --- ESTA ES LA PARTE CORREGIDA ---
+                        peer_address = f"{info['ip']}:{info['port']}"
+                        print(f"{peer_id:<35} {peer_address:<22} {f'{progress_percent} ({status})':<15}")
         
-        time.sleep(10) # Actualizar cada 10 segundos
+        time.sleep(15) # Actualizar cada 15 segundos
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Uso: python tracker.py <puerto>")
+        print("Uso: python3 tracker.py <puerto>")
         sys.exit(1)
         
     try:
@@ -132,6 +140,10 @@ if __name__ == "__main__":
     # Iniciar el hilo que imprime el estado
     status_thread = threading.Thread(target=print_tracker_status, daemon=True)
     status_thread.start()
+
+    # Iniciar el hilo que limpia peers inactivos
+    cleaner_thread = threading.Thread(target=clean_inactive_peers, daemon=True)
+    cleaner_thread.start()
 
     # Usamos ThreadingTCPServer para manejar cada conexión en un nuevo hilo
     server = socketserver.ThreadingTCPServer((TRACKER_HOST, port), TrackerHandler)
