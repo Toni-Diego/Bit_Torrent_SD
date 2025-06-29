@@ -170,19 +170,19 @@ class Peer:
     def create_torrent_metadata(self, file_path):
         try:
             file_size = os.path.getsize(file_path)
-            pieces_hashes = [hashlib.sha1(piece).hexdigest() for piece in iter(lambda: open(file_path, 'rb').read(PIECE_SIZE), b'')]
-            open(file_path, 'rb').close() # Asegurarse de cerrar el archivo
-            
-            # Recrear el iterador para el cálculo de hash, ya que el anterior se consumió
             pieces_hashes = []
             with open(file_path, 'rb') as f:
                 while True:
                     piece = f.read(PIECE_SIZE)
                     if not piece: break
                     pieces_hashes.append(hashlib.sha1(piece).hexdigest())
-
+            
             torrent_hash = hashlib.sha1(str(pieces_hashes).encode()).hexdigest()
-            return {'file_name': os.path.basename(file_path), 'file_size': file_size, 'piece_size': PIECE_SIZE, 'pieces_hashes': pieces_hashes, 'torrent_hash': torrent_hash}
+            return {
+                'file_name': os.path.basename(file_path), 'file_size': file_size,
+                'piece_size': PIECE_SIZE, 'pieces_hashes': pieces_hashes,
+                'torrent_hash': torrent_hash
+            }
         except Exception as e:
             print(f"Error creando metadatos: {e}"); return None
 
