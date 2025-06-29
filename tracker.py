@@ -113,13 +113,13 @@ class TrackerHandler(socketserver.BaseRequestHandler):
 
 def clean_inactive_peers():
     while True:
-        time.sleep(59)
+        time.sleep(10)
         with lock:
             current_time = time.time()
             for torrent_hash, data in list(torrents.items()):
                 inactive_peers = [
                     peer_id for peer_id, info in data['peers'].items()
-                    if current_time - info['last_seen'] > 60 # 90 segundos de inactividad
+                    if current_time - info['last_seen'] > 15 # 90 segundos de inactividad
                 ]
                 for peer_id in inactive_peers:
                     del data['peers'][peer_id]
@@ -132,7 +132,7 @@ def clean_inactive_peers():
 
 def print_tracker_status():
     while True:
-        time.sleep(10)
+        time.sleep(5)
         with lock:
             print("\n" + "="*90)
             print(f"Estado del Tracker - {time.ctime()}")
