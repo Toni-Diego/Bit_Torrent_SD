@@ -27,10 +27,42 @@ class Peer:
     def start(self):
         print(f"Peer iniciado con ID: {self.peer_id}")
         print(f"IP detectada: {self.my_ip}")
+
+        #descarga incpmleta
+        self.load_incomplete_downloads()
         
         server_thread = threading.Thread(target=self.run_server, daemon=True); server_thread.start()
         announcer_thread = threading.Thread(target=self.periodic_announce, daemon=True); announcer_thread.start()
         self.main_menu()
+
+    def load_incomplete_downloads(self):
+        """Escanea la carpeta de descargas en busca de archivos .state para reanudar."""
+        print("Buscando descargas incompletas para reanudar...")
+        downloads_dir = "./downloads"
+        if not os.path.exists(downloads_dir):
+            return
+
+        for filename in os.listdir(downloads_dir):
+            if filename.endswith(DOWNLOAD_STATE_EXTENSION):
+                state_path = os.path.join(downloads_dir, filename)
+                try:
+                    with open(state_path, 'r') as f:
+                        state_data = json.load(f)
+                    
+                    # Verificar si el estado tiene la estructura correcta
+                    if 'metadata' in state_data and 'have_pieces' in state_data:
+                        metadata = state_data['metadata']
+                        torrent_hash = metadata['torrent_hash']
+                        
+                        # Evitar cargar algo que ya está completo o siendo compartido
+                        if os.path.exists(os.path.join(downloads_dir, metadata['file_name'])) and torrent_hash in self.seeding_torrents:
+                            continue
+
+                        print(f"Reanudando descarga para: {metadata['file_name']}")
+                        self.start_download(metadata, state_data['have_pieces'])
+
+                except (json.JSONDecodeError, KeyError, FileNotFoundError) as e:
+                    print(f"Error al cargar el archivo de estado '{filename}': {e}. Omitiendo.")
 
     def main_menu(self):
         while not self.stop_event.is_set():
@@ -132,14 +164,14 @@ class Peer:
                     progress = self.downloading_torrents[thash].get_progress()
                 # En anuncios periódicos ya no enviamos metadatos
                 self.announce_once(thash, progress)
-    
-    def start_download(self, torrent_metadata):
+
+    def start_download(self, torrent_metadata, initial_pieces=None):
         torrent_hash = torrent_metadata['torrent_hash']
         with self.lock:
             if torrent_hash in self.downloading_torrents or torrent_hash in self.seeding_torrents:
-                print("Ya estás manejando este archivo."); return
+                return # Ya se está manejando
             
-            download_manager = DownloadManager(torrent_metadata, self.peer_id, self.request_from_tracker)
+            download_manager = DownloadManager(torrent_metadata, self.peer_id, self.request_from_tracker, initial_pieces)
             self.downloading_torrents[torrent_hash] = download_manager
 
         initial_progress = download_manager.get_progress()
@@ -147,7 +179,7 @@ class Peer:
 
         download_thread = threading.Thread(target=download_manager.start, args=(self.stop_event, self.lock, self.seeding_torrents, self.downloading_torrents, self.announce_once), daemon=True)
         download_thread.start()
-        print(f"Descarga iniciada para '{torrent_metadata['file_name']}'.")
+        print(f"Descarga iniciada/reanudada para '{torrent_metadata['file_name']}'.")
 
     # --- Funciones de utilidad y servidor (sin cambios mayores) ---
     def request_from_tracker(self, message):
@@ -260,23 +292,27 @@ class Peer:
                 print("No hay actividad de archivos.")
 
 class DownloadManager:
-    """Gestiona la descarga de un único torrent."""
-    def __init__(self, torrent_data, peer_id, tracker_requester):
+    '''Gestiona la descarga de un torrent'''
+    def __init__(self, torrent_data, peer_id, tracker_requester, initial_pieces=None):
         self.torrent_data = torrent_data
         self.peer_id = peer_id
-        self.tracker_requester = tracker_requester # Pasa la función para contactar al tracker
+        self.tracker_requester = tracker_requester
         self.total_pieces = len(torrent_data['pieces_hashes'])
         self.output_path = os.path.join("./downloads", torrent_data['file_name'])
         self.state_path = self.output_path + DOWNLOAD_STATE_EXTENSION
         
-        self.have_pieces = set()
-        self.needed_pieces = set(range(self.total_pieces))
+        self.have_pieces = set(initial_pieces) if initial_pieces else set()
+        self.needed_pieces = set(range(self.total_pieces)) - self.have_pieces
         self.lock = threading.Lock()
         
         self.pbar = tqdm(total=self.total_pieces, unit='piece', desc=f"DL {torrent_data['file_name'][:15]}..", leave=False)
+        self.pbar.update(len(self.have_pieces)) # Actualizar barra con piezas existentes
 
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
-        self.load_state()
+        if not os.path.exists(self.output_path):
+            self.create_empty_file()
+        
+        self.save_state() # Guardar el estado inicial (o reanudado)
 
     def load_state(self):
         if os.path.exists(self.state_path):
@@ -299,9 +335,14 @@ class DownloadManager:
                 f.write(b'\0')
 
     def save_state(self):
+        """Guarda tanto los metadatos como las piezas que tenemos."""
         with self.lock:
+            state_data = {
+                'metadata': self.torrent_data,
+                'have_pieces': list(self.have_pieces)
+            }
             with open(self.state_path, 'w') as f:
-                json.dump({'have_pieces': list(self.have_pieces)}, f)
+                json.dump(state_data, f)
 
     def get_progress(self):
         with self.lock:
@@ -339,12 +380,13 @@ class DownloadManager:
             print(f"\n¡Descarga completa para '{self.torrent_data['file_name']}'!")
             if os.path.exists(self.state_path): os.remove(self.state_path)
             with global_lock:
-                del downloading_torrents[self.torrent_data['torrent_hash']]
+                if self.torrent_data['torrent_hash'] in downloading_torrents:
+                    del downloading_torrents[self.torrent_data['torrent_hash']]
                 seeding_torrents[self.torrent_data['torrent_hash']] = {
                     'metadata': self.torrent_data,
                     'local_path': self.output_path
                 }
-                self.announce_once_dm(1.0) # Anunciar que ahora es seeder
+                self.announce_once_dm(self.torrent_data['torrent_hash'], 1.0) # Anunciar que ahora es seeder
         else:
             print(f"\nDescarga para '{self.torrent_data['file_name']}' interrumpida.")
 
