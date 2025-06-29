@@ -380,13 +380,12 @@ class DownloadManager:
             print(f"\n¡Descarga completa para '{self.torrent_data['file_name']}'!")
             if os.path.exists(self.state_path): os.remove(self.state_path)
             with global_lock:
-                if self.torrent_data['torrent_hash'] in downloading_torrents:
-                    del downloading_torrents[self.torrent_data['torrent_hash']]
+                del downloading_torrents[self.torrent_data['torrent_hash']]
                 seeding_torrents[self.torrent_data['torrent_hash']] = {
                     'metadata': self.torrent_data,
                     'local_path': self.output_path
                 }
-                self.announce_once_dm(self.torrent_data['torrent_hash'], 1.0) # Anunciar que ahora es seeder
+                self.announce_once_dm( 1.0) # Anunciar que ahora es seeder
         else:
             print(f"\nDescarga para '{self.torrent_data['file_name']}' interrumpida.")
 
