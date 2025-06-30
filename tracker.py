@@ -132,7 +132,7 @@ def clean_inactive_peers():
 
 def print_tracker_status():
     while True:
-        time.sleep(10)
+        time.sleep(5)
         with lock:
             print("\n" + "="*90)
             print(f"Estado del Tracker - {time.ctime()}")
