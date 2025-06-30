@@ -23,7 +23,7 @@ lock = threading.Lock()
 class TrackerHandler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
-            raw_data = self.request.recv(4096).strip() # Aumentamos el buffer por si vienen metadatos
+            raw_data = self.request.recv(16384).strip() # Aumentamos el buffer por si vienen metadatos
             if not raw_data: return
             
             message = json.loads(raw_data.decode('utf-8'))
