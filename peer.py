@@ -531,7 +531,7 @@ class DownloadManager:
                 
                 s.settimeout(10)
                 while len(piece_data) < expected_size:
-                    chunk = s.recv(4096)
+                    chunk = s.recv(8192)
                     if not chunk: return None
                     piece_data += chunk
                 
